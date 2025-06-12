@@ -131,9 +131,11 @@ class DataCollectionAgent:
     def _search_with_tavily_enhanced(self, query: str, topic: str) -> List[Dict]:
         """增强版Tavily搜索"""
         try:
-            # 结合选题和具体方向进行搜索
-            enhanced_query = f"{topic} {query} 数据 统计 报告"
-            
+            # 结合选题和具体方向进行搜索，并尝试限定常见数据文件类型
+            enhanced_query = (
+                f"{topic} {query} 数据 统计 报告 filetype:csv OR filetype:xls OR filetype:xlsx OR filetype:pdf"
+            )
+
             data = {
                 "api_key": self.tavily_api_key,
                 "query": enhanced_query,
@@ -149,7 +151,14 @@ class DataCollectionAgent:
             result = response.json()
             
             if 'results' in result:
-                return result['results']
+                results = result['results']
+                # 简单根据标题匹配选题或方向关键词以提升相关度
+                filtered = [
+                    r for r in results
+                    if topic.lower() in r.get('title', '').lower()
+                    or query.lower() in r.get('title', '').lower()
+                ]
+                return filtered if filtered else results
             return []
             
         except Exception as e:
@@ -469,37 +478,50 @@ def data_collection_phase():
                 st.markdown(message["content"])
 
         st.subheader("选择要自动收集的数据方向")
-        
-        # 修改这部分逻辑
-        directions = re.findall(r"####\s*(.+)", st.session_state.data_directions)
-        if not directions:
-            directions = re.findall(r"-\s*(.+)", st.session_state.data_directions)
-        
-        # 生成具体的检索问题，结合选题主题
+
+        parsed = parse_data_directions(st.session_state.data_directions)
+        second_hand = parsed.get("二手数据", [])
+        research = parsed.get("调研数据", []) + parsed.get("自主数据挖掘", [])
+
         topic = st.session_state.selected_topic
-        specific_queries = []
-        for direction in directions:
-            # 将方向转换为具体的检索问题
-            specific_query = f"{topic} {direction.strip()}"
-            specific_queries.append(specific_query)
-        
-        # 显示具体的检索问题供用户编辑
-        directions_input = st.text_area(
-            f"基于选题'{topic}'生成的具体检索问题（一行一个，可自行修改）", 
-            value="\n".join(specific_queries),
-            help="这些检索问题将用于网络搜索，确保包含了选题的核心主题"
-        )
-        if st.button("🚀 启动智能数据收集"):
-            queries = [d.strip() for d in directions_input.splitlines() if d.strip()]
-            if queries:
-                df = collect_data_from_directions(queries)
-                if not df.empty:
-                    processor = DataProcessor(df)
-                    st.session_state['current_processor'] = processor
-                    st.session_state['data_uploaded'] = True
-                    st.success("✅ 智能数据收集完成并载入成功！")
-                else:
-                    st.warning("⚠️ 未能获取到足够的结构化数据，请尝试调整数据收集方向或手动上传数据")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("#### 二手数据检索")
+            queries = [f"{topic} {d.strip()}" for d in second_hand]
+            directions_input = st.text_area(
+                "可编辑的检索问题（一行一个）",
+                value="\n".join(queries),
+                key="second_hand_input",
+                help="这些检索问题将用于网络搜索"
+            )
+            if st.button("🚀 启动智能数据收集"):
+                q_list = [d.strip() for d in directions_input.splitlines() if d.strip()]
+                if q_list:
+                    df = collect_data_from_directions(q_list)
+                    if not df.empty:
+                        processor = DataProcessor(df)
+                        st.session_state['current_processor'] = processor
+                        st.session_state['data_uploaded'] = True
+                        st.success("✅ 智能数据收集完成并载入成功！")
+                    else:
+                        st.warning("⚠️ 未能获取到足够的结构化数据，请尝试调整数据收集方向或手动上传数据")
+
+        with col2:
+            if research:
+                st.markdown("#### 调研/自主数据挖掘")
+                for d in research:
+                    st.write(f"- {d}")
+                if st.button("生成问卷", key="gen_q"):
+                    st.session_state.questionnaire = generate_questionnaire(research)
+                if st.button("生成爬虫代码", key="gen_crawler"):
+                    st.session_state.crawler_code = generate_crawler_code(research)
+                if st.session_state.get('questionnaire'):
+                    st.subheader("问卷示例")
+                    st.markdown(st.session_state.questionnaire)
+                if st.session_state.get('crawler_code'):
+                    st.subheader("爬虫代码示例")
+                    st.code(st.session_state.crawler_code, language='python')
 
         refresh_col1, refresh_col2 = st.columns([1, 10])
         with refresh_col1:
@@ -1605,6 +1627,50 @@ def extract_structured_from_text(text: str) -> pd.DataFrame:
     except Exception as e:
         logger.error(f"结构化解析失败: {e}")
     return pd.DataFrame()
+
+# 解析模型生成的数据收集方向，按类别返回列表
+def parse_data_directions(text: str) -> Dict[str, List[str]]:
+    """将数据收集建议文本解析为类别 -> 方向列表的结构"""
+    sections = re.findall(r"###\s*(.+?)\n(.*?)(?=\n###|$)", text, re.DOTALL)
+    result: Dict[str, List[str]] = {}
+    for name, content in sections:
+        lines = re.findall(r"####\s*(.+)", content)
+        if not lines:
+            lines = re.findall(r"-\s*(.+)", content)
+        if lines:
+            result[name.strip()] = [l.strip() for l in lines]
+    return result
+
+
+def generate_questionnaire(directions: List[str]) -> str:
+    """调用模型生成不超过15题的调研问卷"""
+    prompt = (
+        "请根据以下调研方向设计一份不超过15题的问卷，直接列出问题列表：\n" + "\n".join(directions)
+    )
+    messages = [
+        {"role": "system", "content": "你是一名经验丰富的问卷设计专家"},
+        {"role": "user", "content": prompt},
+    ]
+    resp = client.chat_completions_create(messages)
+    if 'choices' in resp and resp['choices']:
+        return resp['choices'][0]['message']['content']
+    return "问卷生成失败"
+
+
+def generate_crawler_code(directions: List[str]) -> str:
+    """根据自主数据挖掘需求生成简单的爬虫示例代码"""
+    prompt = (
+        "请依据以下网站数据挖掘需求，提供一个Python爬虫示例，使用requests和BeautifulSoup，将结果保存为CSV：\n"
+        + "\n".join(directions)
+    )
+    messages = [
+        {"role": "system", "content": "你是一名擅长编写网络爬虫的Python开发者"},
+        {"role": "user", "content": prompt},
+    ]
+    resp = client.chat_completions_create(messages)
+    if 'choices' in resp and resp['choices']:
+        return resp['choices'][0]['message']['content']
+    return "爬虫代码生成失败"
 
 # 根据多个数据方向自动收集网络数据并合并
 def collect_data_from_directions(directions: List[str]) -> pd.DataFrame:
